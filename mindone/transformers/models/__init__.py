@@ -1,1 +1,1 @@
-from . import bit, blip_2, clip, dpt, t5, xlm_roberta
+from . import bit, blip_2, clap, clip, dpt, hubert, t5, whisper, xlm_roberta
