@@ -4,10 +4,13 @@ from typing import Tuple, Union, Dict, List
 
 import numpy as np
 import torch
+from safetensors.torch import load_file
 import mindspore as ms
-from transformers import Wav2Vec2ForCTC
-from transformers.models.hubert import HubertForCTC as pt_HubertForCTC
+from transformers import Wav2Vec2Processor
+from transformers.models.hubert import HubertConfig, HubertForCTC as pt_HubertForCTC
 from mindone.transformers.models.hubert import HubertForCTC as ms_HubertForCTC
+from transformers.modeling_outputs import ModelOutput as pt_ModelOutput
+from mindone.transformers.modeling_outputs import ModelOutput as ms_ModelOutput
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +31,21 @@ def test_hubert(model_name, mode, dtype):
     ms.set_context(mode=mode, jit_syntax_level=ms.STRICT)
 
     # init model
-    processor = Wav2Vec2ForCTC.from_pretrained(model_name)
-    pt_model = pt_HubertForCTC.from_pretrained(model_name)
-    ms_model = ms_HubertForCTC.from_pretrained(model_name)
+    config = HubertConfig.from_pretrained(model_name)
+    pt_model = pt_HubertForCTC(config)
+    ms_model = ms_HubertForCTC(config)
+
+    state_dict = load_file(model_name)
+    logger.info(">>> Loading pytorch model from %s", model_name)
+    pt_model.load_state_dict(state_dict)
+    logger.info(">>> Loading mindspore model from %s", model_name)
+    ms_model.load_param_into_net(ms_model, state_dict)
 
     # convert model dtype
     _set_model_dtype(pt_model, ms_model, dtype)
 
     # get inputs
+    processor = Wav2Vec2Processor.from_pretrained(model_name)
     shape = (2, 16000)
     input_values = _generate_inputs(shape)
     inputs = processor(input_values, return_tensors="pt", sampling_rate=16000)
@@ -44,8 +54,7 @@ def test_hubert(model_name, mode, dtype):
         pt_outputs = pt_model(**inputs)
     ms_outputs = ms_model(**inputs)
 
-
-    diffs = _compute_diffs(pt_outputs, ms_outputs)
+    diffs = _compute_diffs(pt_outputs.hidden_states, ms_outputs.hidden_states)
 
     eps = THRESHOLD_FP16 if dtype == "fp16" else THRESHOLD_FP32
     assert (np.array(diffs) < eps).all(), f"Outputs({np.array(diffs).tolist()}) has diff bigger than {eps}"
@@ -98,13 +107,12 @@ def _set_dtype(model, dtype):
     return model
 
 
-def _generate_inputs(shape: Union[int, Tuple[int, ...]]):
-    return np.random.rand(shape).astype(np.float32)
+def _generate_inputs(shape: Tuple[int, ...]):
+    return np.random.rand(*shape).astype(np.float32)
 
 
 def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
-    print(type(pt_outputs), type(ms_outputs))
-    if isinstance(pt_outputs, ModelOutput):
+    if isinstance(pt_outputs, pt_ModelOutput):
         pt_outputs = tuple(pt_outputs.values())
     elif not isinstance(pt_outputs, (tuple, list)):
         pt_outputs = (pt_outputs,)
@@ -113,7 +121,7 @@ def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
 
     diffs = []
     for p, m in zip(pt_outputs, ms_outputs):
-        if isinstance(p, ModelOutput):
+        if isinstance(p, pt_ModelOutput):
             p = tuple(p.values())[0]
 
         p = p.detach().cpu().numpy()
@@ -126,3 +134,6 @@ def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
         diffs.append(d)
 
     return diffs
+
+if __name__ == "__main__":
+    pass
