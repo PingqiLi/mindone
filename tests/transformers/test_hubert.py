@@ -6,17 +6,46 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 import mindspore as ms
-from transformers import Wav2Vec2Processor
+from transformers import Wav2Vec2Processor, AutoProcessor
 from transformers.models.hubert import HubertConfig, HubertForCTC as pt_HubertForCTC
 from mindone.transformers.models.hubert import HubertForCTC as ms_HubertForCTC
 from transformers.modeling_outputs import ModelOutput as pt_ModelOutput
 from mindone.transformers.modeling_outputs import ModelOutput as ms_ModelOutput
+from datasets import load_dataset
 
 logger = logging.getLogger(__name__)
 
 THRESHOLD_FP16 = 1e-2
 THRESHOLD_FP32 = 5e-3
 
+def test_ms_hubert():
+    ms.set_context(mode=1, pynative_synchronize=True)
+    # mindspore.set_context(mode=0, jit_syntax_level=mindspore.STRICT)
+
+    dataset = load_dataset("hf-internal-testing/librispeech_asr_demo", "clean", split="validation",
+                           trust_remote_code=True)
+    dataset = dataset.sort("id")
+    sampling_rate = dataset.features["audio"].sampling_rate
+
+    model_path = "/home/pingqi/.cache/huggingface/hub/models--facebook--hubert-large-ls960-ft/snapshots/ece5fabbf034c1073acae96d5401b25be96709d8"
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = ms_HubertForCTC.from_pretrained(model_path)
+
+    # audio file is decoded on the fly
+    inputs = processor(dataset[0]["audio"]["array"], sampling_rate=sampling_rate, return_tensors="pt")
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
+
+    # transcribe speech
+    transcription = processor.batch_decode(predicted_ids)
+    print(transcription[0])
+
+    inputs["labels"] = processor(text=dataset[0]["text"], return_tensors="pt").input_ids
+
+    # compute loss
+    loss = model(**inputs).loss
+    round(loss.item(), 2)
 
 @pytest.mark.parametrize(
     "name,mode,dtype",
@@ -136,4 +165,4 @@ def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
     return diffs
 
 if __name__ == "__main__":
-    pass
+    test_ms_hubert()
