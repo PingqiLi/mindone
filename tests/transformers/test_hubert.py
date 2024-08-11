@@ -1,7 +1,7 @@
 import pytest
 import logging
 from typing import Tuple, Union, Dict, List
-
+import random
 import numpy as np
 import torch
 from safetensors.torch import load_file
@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 THRESHOLD_FP16 = 1e-2
 THRESHOLD_FP32 = 5e-3
 
-def test_ms_hubert():
+
+def test_ms_hubert(model_path):
     ms.set_context(mode=1, pynative_synchronize=True)
     # mindspore.set_context(mode=0, jit_syntax_level=mindspore.STRICT)
 
@@ -27,21 +28,22 @@ def test_ms_hubert():
     dataset = dataset.sort("id")
     sampling_rate = dataset.features["audio"].sampling_rate
 
-    model_path = "/home/pingqi/.cache/huggingface/hub/models--facebook--hubert-large-ls960-ft/snapshots/ece5fabbf034c1073acae96d5401b25be96709d8"
     processor = AutoProcessor.from_pretrained(model_path)
     model = ms_HubertForCTC.from_pretrained(model_path)
 
     # audio file is decoded on the fly
-    inputs = processor(dataset[0]["audio"]["array"], sampling_rate=sampling_rate, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(**inputs).logits
-    predicted_ids = torch.argmax(logits, dim=-1)
+    inputs = processor(dataset[0]["audio"]["array"], sampling_rate=sampling_rate, return_tensors="np")
+    for k, v in inputs.items():
+        inputs[k] = ms.Tensor(v)
+
+    logits = model(**inputs).logits
+    predicted_ids = ms.ops.argmax(logits, dim=-1)
 
     # transcribe speech
     transcription = processor.batch_decode(predicted_ids)
     print(transcription[0])
 
-    inputs["labels"] = processor(text=dataset[0]["text"], return_tensors="pt").input_ids
+    inputs["labels"] = ms.Tensor(processor(text=dataset[0]["text"], return_tensors="np").input_ids)
 
     # compute loss
     loss = model(**inputs).loss
@@ -59,34 +61,41 @@ def test_ms_hubert():
 def test_hubert(model_name, mode, dtype):
     ms.set_context(mode=mode, jit_syntax_level=ms.STRICT)
 
-    # init model
-    config = HubertConfig.from_pretrained(model_name)
-    pt_model = pt_HubertForCTC(config)
-    ms_model = ms_HubertForCTC(config)
+    dataset = load_dataset("hf-internal-testing/librispeech_asr_demo", "clean", split="validation",
+                           trust_remote_code=True)
+    dataset = dataset.sort("id")
+    sampling_rate = dataset.features["audio"].sampling_rate
 
-    state_dict = load_file(model_name)
-    logger.info(">>> Loading pytorch model from %s", model_name)
-    pt_model.load_state_dict(state_dict)
-    logger.info(">>> Loading mindspore model from %s", model_name)
-    ms_model.load_param_into_net(ms_model, state_dict)
+    processor = AutoProcessor.from_pretrained(model_name)
+    pt_model = pt_HubertForCTC.from_pretrained(model_name)
+    ms_model = ms_HubertForCTC.from_pretrained(model_name)
+
+    # prepare inputs
+    batch_data = _get_batch_data(dataset, batch_size=1, processor=processor, sampling_rate=sampling_rate)
+
+    pt_inputs = {key: torch.tensor(value) for key, value in batch_data.items()}
+    ms_inputs = batch_data
+    for k, v in ms_inputs.items():
+        ms_inputs[k] = ms.Tensor(v)
 
     # convert model dtype
     _set_model_dtype(pt_model, ms_model, dtype)
 
-    # get inputs
-    processor = Wav2Vec2Processor.from_pretrained(model_name)
-    shape = (2, 16000)
-    input_values = _generate_inputs(shape)
-    inputs = processor(input_values, return_tensors="pt", sampling_rate=16000)
-
     with torch.no_grad():
-        pt_outputs = pt_model(**inputs)
-    ms_outputs = ms_model(**inputs)
-
+        pt_outputs = pt_model(**pt_inputs, output_hidden_states=True)
+    ms_outputs = ms_model(**ms_inputs, output_hidden_states=True)
+    # breakpoint()
     diffs = _compute_diffs(pt_outputs.hidden_states, ms_outputs.hidden_states)
-
+    print(diffs)
     eps = THRESHOLD_FP16 if dtype == "fp16" else THRESHOLD_FP32
     assert (np.array(diffs) < eps).all(), f"Outputs({np.array(diffs).tolist()}) has diff bigger than {eps}"
+
+
+def _get_batch_data(dataset, batch_size, processor, sampling_rate):
+    random_indices = random.sample(range(len(dataset)), batch_size)
+    audio_arrays = [dataset[i]["audio"]["array"] for i in random_indices]
+    inputs = processor(audio_arrays, sampling_rate=sampling_rate, return_tensors="np", padding=True)
+    return inputs
 
 
 _TORCH_FP16_BLACKLIST = (
@@ -136,10 +145,6 @@ def _set_dtype(model, dtype):
     return model
 
 
-def _generate_inputs(shape: Tuple[int, ...]):
-    return np.random.rand(*shape).astype(np.float32)
-
-
 def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
     if isinstance(pt_outputs, pt_ModelOutput):
         pt_outputs = tuple(pt_outputs.values())
@@ -164,5 +169,7 @@ def _compute_diffs(pt_outputs: torch.Tensor, ms_outputs: ms.Tensor):
 
     return diffs
 
+
 if __name__ == "__main__":
-    test_ms_hubert()
+    model_path = "/home/pingqi/.cache/huggingface/hub/models--facebook--hubert-large-ls960-ft/snapshots/ece5fabbf034c1073acae96d5401b25be96709d8"
+    test_hubert(model_name=model_path, mode=1, dtype="fp32")

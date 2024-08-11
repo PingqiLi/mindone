@@ -24,14 +24,8 @@ from mindspore import Parameter, Tensor, ops
 from mindspore.common.initializer import initializer, Normal, Uniform, HeNormal
 
 # temporary dependencies from mindnlp v0.3.1
-# from mindnlp.modules.functional.weight_norm import weight_norm
-# from mindnlp.modules.functional import finfo
-
-# temporary dependencies from mindnlp v0.4.0_0810 daily build
-from mindnlp.core.nn.utils import weight_norm as mnlp_weight_norm
-from mindnlp.core.ops import finfo as mnlp_finfo
-from mindnlp.core.nn import Conv1d as mnlp_Conv1d
-from mindnlp.core.nn import LayerNorm as mnlp_LayerNorm
+from mindnlp.modules.functional.weight_norm import weight_norm
+from mindnlp.modules.functional import finfo
 
 
 from ...activations import ACT2FN
@@ -186,12 +180,13 @@ class HubertNoLayerNormConvLayer(nn.Cell):
         self.in_conv_dim = config.conv_dim[layer_id - 1] if layer_id > 0 else 1
         self.out_conv_dim = config.conv_dim[layer_id]
 
-        self.conv = mnlp_Conv1d(
+        self.conv = nn.Conv1d(
             self.in_conv_dim,
             self.out_conv_dim,
             kernel_size=config.conv_kernel[layer_id],
             stride=config.conv_stride[layer_id],
-            bias=config.conv_bias,
+            has_bias=config.conv_bias,
+            pad_mode="valid",
         )
         self.activation = ACT2FN[config.feat_extract_activation]
 
@@ -208,14 +203,15 @@ class HubertLayerNormConvLayer(nn.Cell):
         self.in_conv_dim = config.conv_dim[layer_id - 1] if layer_id > 0 else 1
         self.out_conv_dim = config.conv_dim[layer_id]
 
-        self.conv = mnlp_Conv1d(
+        self.conv = nn.Conv1d(
             self.in_conv_dim,
             self.out_conv_dim,
             kernel_size=config.conv_kernel[layer_id],
             stride=config.conv_stride[layer_id],
-            bias=config.conv_bias,
+            has_bias=config.conv_bias,
+            pad_mode="valid",
         )
-        self.layer_norm = mnlp_LayerNorm(self.out_conv_dim)
+        self.layer_norm = nn.LayerNorm(self.out_conv_dim)
         self.activation = ACT2FN[config.feat_extract_activation]
 
     def construct(self, hidden_states):
@@ -234,12 +230,13 @@ class HubertGroupNormConvLayer(nn.Cell):
         self.in_conv_dim = config.conv_dim[layer_id - 1] if layer_id > 0 else 1
         self.out_conv_dim = config.conv_dim[layer_id]
 
-        self.conv = mnlp_Conv1d(
+        self.conv = nn.Conv1d(
             self.in_conv_dim,
             self.out_conv_dim,
             kernel_size=config.conv_kernel[layer_id],
             stride=config.conv_stride[layer_id],
-            bias=config.conv_bias,
+            has_bias=config.conv_bias,
+            pad_mode="valid",
         )
         self.activation = ACT2FN[config.feat_extract_activation]
         # NOTE: the naming is confusing, but let it be...
@@ -256,14 +253,16 @@ class HubertGroupNormConvLayer(nn.Cell):
 class HubertPositionalConvEmbedding(nn.Cell):
     def __init__(self, config: HubertConfig):
         super().__init__()
-        self.conv = mnlp_Conv1d(
+        self.conv = nn.Conv1d(
             config.hidden_size,
             config.hidden_size,
             kernel_size=config.num_conv_pos_embeddings,
+            pad_mode='pad',
             padding=config.num_conv_pos_embeddings // 2,
-            groups=config.num_conv_pos_embedding_groups,
+            group=config.num_conv_pos_embedding_groups,
+            has_bias=True,      # TODO: confirm this
         )
-        self.conv = mnlp_weight_norm(self.conv, name='weight', dim=2)
+        self.conv = weight_norm(self.conv, name='weight', dim=2)
         self.padding = HubertSamePadLayer(config.num_conv_pos_embeddings)
         self.activation = ACT2FN[config.feat_extract_activation]
 
@@ -324,7 +323,7 @@ class HubertFeatureProjection(nn.Cell):
         super().__init__()
         self.feat_proj_layer_norm = config.feat_proj_layer_norm
         if self.feat_proj_layer_norm:
-            self.layer_norm = mnlp_LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
+            self.layer_norm = nn.LayerNorm(config.conv_dim[-1], epsilon=config.layer_norm_eps)
         self.projection = nn.Dense(config.conv_dim[-1], config.hidden_size)
         self.dropout = nn.Dropout(p=config.feat_proj_dropout)
 
@@ -525,9 +524,9 @@ class HubertEncoderLayer(nn.Cell):
             is_decoder=False,
         )
         self.dropout = nn.Dropout(p=config.hidden_dropout)
-        self.layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
 
     def construct(self, hidden_states, attention_mask=None, output_attentions=False):
         attn_residual = hidden_states
@@ -558,7 +557,7 @@ class HubertAttnAdapterLayer(nn.Cell):
         self.input_dim = config.adapter_attn_dim
         self.hidden_dim = config.hidden_size
 
-        self.norm = mnlp_LayerNorm(self.hidden_dim)
+        self.norm = nn.LayerNorm(self.hidden_dim)
         self.linear_1 = nn.Dense(self.hidden_dim, self.input_dim)
         self.act_fn = nn.ReLU()
         self.linear_2 = nn.Dense(self.input_dim, self.hidden_dim)
@@ -582,9 +581,9 @@ class HubertEncoderLayerStableLayerNorm(nn.Cell):
             is_decoder=False,
         )
         self.dropout = nn.Dropout(p=config.hidden_dropout)
-        self.layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
 
         if getattr(config, "adapter_attn_dim", None) is not None:
             self.adapter_layer = HubertAttnAdapterLayer(config)
@@ -621,7 +620,7 @@ class HubertEncoder(nn.Cell):
         super().__init__()
         self.config = config
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
-        self.layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
         self.dropout = nn.Dropout(p=config.hidden_dropout)
         self.layers = nn.CellList([HubertEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
@@ -643,7 +642,7 @@ class HubertEncoder(nn.Cell):
 
             # extend attention_mask
             attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
-            attention_mask = attention_mask * float(mnlp_finfo(hidden_states.dtype).min)
+            attention_mask = attention_mask * finfo(hidden_states.dtype, 'min')
             attention_mask = attention_mask.expand(
                 attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
             )
@@ -690,7 +689,7 @@ class HubertEncoderStableLayerNorm(nn.Cell):
         super().__init__()
         self.config = config
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
-        self.layer_norm = mnlp_LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
         self.dropout = nn.Dropout(p=config.hidden_dropout)
         self.layers = nn.CellList([HubertEncoderLayerStableLayerNorm(config) for _ in range(config.num_hidden_layers)])
 
@@ -712,7 +711,7 @@ class HubertEncoderStableLayerNorm(nn.Cell):
 
             # extend attention_mask
             attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
-            attention_mask = attention_mask * float(mnlp_finfo(hidden_states.dtype).min)
+            attention_mask = attention_mask * finfo(hidden_states.dtype, 'min')
             attention_mask = attention_mask.expand(
                 attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
             )
@@ -770,12 +769,12 @@ class HubertPreTrainedModel(MSPreTrainedModel):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             cell.weight.set_data(initializer(Normal(self.config.initializer_range), cell.weight.shape, cell.weight.dtype))
-        elif isinstance(cell, (mnlp_LayerNorm, nn.GroupNorm)):
+        elif isinstance(cell, (nn.LayerNorm, nn.GroupNorm)):
             cell.weight.set_data(initializer('ones', cell.weight.shape, cell.weight.dtype))
             cell.bias.set_data(initializer('zeros', cell.bias.shape, cell.bias.dtype))
-        elif isinstance(cell, mnlp_Conv1d):
+        elif isinstance(cell, nn.Conv1d):
             cell.weight.set_data(initializer(HeNormal(), cell.weight.shape, cell.weight.dtype))
-        if isinstance(cell, (nn.Dense, mnlp_Conv1d)) and cell.bias is not None:
+        if isinstance(cell, (nn.Dense, nn.Conv1d)) and cell.bias is not None:
             cell.bias.set_data(initializer('zeros', cell.bias.shape, cell.bias.dtype))
 
     def _get_feat_extract_output_lengths(self, input_lengths: Union[Tensor, int]):
