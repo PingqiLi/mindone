@@ -1766,7 +1766,7 @@ class MSPreTrainedModel(nn.Cell, ModuleUtilsMixin, PushToHubMixin, PeftAdapterMi
         expected_keys = list(model_state_dict.keys())
         prefix = model.base_model_prefix
         original_loaded_keys = loaded_keys
-
+        # breakpoint()
         if len(prefix) > 0:
             has_prefix_module = any(s.startswith(prefix) for s in loaded_keys)
             expects_prefix_module = any(s.startswith(prefix) for s in expected_keys)
