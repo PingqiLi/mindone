@@ -14,13 +14,16 @@
 
 import inspect
 from typing import List, Optional, Set, Tuple, Union, TypeVar, Any
+from types import MethodType
 
 from transformers.utils import logging
 
+import numpy as np
 import mindspore as ms
 from mindspore import nn, ops, Parameter
 from mindspore.nn import Cell
 from mindspore.common.initializer import Normal, Zero, initializer
+from mindspore.ops import constexpr
 
 ALL_LAYERNORM_LAYERS = [nn.LayerNorm]
 
@@ -166,163 +169,52 @@ def find_pruneable_heads_and_indices(
 
 T_cell = TypeVar('T_cell', bound=Cell)
 
-def weight_norm(cell: T_cell, name: str = 'weight', dim: int = 0) -> T_cell:
-    r"""Apply weight normalization to a parameter in the given cell.
-
-    .. math::
-         \mathbf{w} = g \dfrac{\mathbf{v}}{\|\mathbf{v}\|}
-
-    Weight normalization is a reparameterization that decouples the magnitude
-    of a weight tensor from its direction. This replaces the parameter specified
-    by :attr:`name` (e.g. ``'weight'``) with two parameters: one specifying the magnitude
-    (e.g. ``'weight_g'``) and one specifying the direction (e.g. ``'weight_v'``).
-    Weight normalization is implemented via a hook that recomputes the weight
-    tensor from the magnitude and direction before every :meth:`~Cell.forward`
-    call.
-
-    By default, with ``dim=0``, the norm is computed independently per output
-    channel/plane. To compute a norm over the entire weight tensor, use
-    ``dim=None``.
-
-    See https://arxiv.org/abs/1602.07868
-
-    .. warning::
-
-        This function is deprecated.  Use :func:`torch.nn.utils.parametrizations.weight_norm`
-        which uses the modern parametrization API.  The new ``weight_norm`` is compatible
-        with ``state_dict`` generated from old ``weight_norm``.
-
-        Migration guide:
-
-        * The magnitude (``weight_g``) and direction (``weight_v``) are now expressed
-          as ``parametrizations.weight.original0`` and ``parametrizations.weight.original1``
-          respectively.  If this is bothering you, please comment on
-          https://github.com/pytorch/pytorch/issues/102999
-
-        * To remove the weight normalization reparametrization, use
-          :func:`torch.nn.utils.parametrize.remove_parametrizations`.
-        * The weight is no longer recomputed once at cell forward; instead, it will
-          be recomputed on every access.  To restore the old behavior, use
-          :func:`torch.nn.utils.parametrize.cached` before invoking the cell
-          in question.
-
-    Args:
-        cell (Cell): containing cell
-        name (str, optional): name of weight parameter
-        dim (int, optional): dimension over which to compute the norm
-
-    Returns:
-        The original cell with the weight norm hook
-
-    Example::
-
-        >>> m = weight_norm(nn.Dense(20, 40), name='weight')
-        >>> m
-        Linear(in_features=20, out_features=40, bias=True)
-        >>> m.weight_g.size()
-        torch.Size([40, 1])
-        >>> m.weight_v.size()
-        torch.Size([40, 20])
-
-    """
-    WeightNorm.apply(cell, name, dim)
-    return cell
-
-
-def _norm_except_dim(weight_v, pows, dim):
-    r"""
-    calculte g/||weight_v|| * weight_v method 
-    """
+def _norm_except_dim(weight_v: ms.Tensor, p:float, dim:int=-1) -> ms.Tensor:
+    ''' ||weight_v|| '''
+    weight_v = weight_v.asnumpy()
     if dim == -1:
-        return ops.norm(weight_v, pows)
+        return np.linalg.norm(weight_v, p)
     if dim == 0:
-        w_shape_v = weight_v.shape[0]  # avoid macOS error
-        output_size = (w_shape_v,) + (1,) * (weight_v.ndim - 1)
-        return ops.norm(weight_v.view((w_shape_v, -1)), pows, 1).view(output_size)
+        output_size = (weight_v.shape[0],) + (1,) * (weight_v.ndim - 1)
+        return np.linalg.norm(weight_v.reshape((weight_v.shape[0], -1)), p, 1).reshape(output_size)
     if dim == (weight_v.ndim - 1):
         output_size = (1,) * (weight_v.ndim - 1) + (weight_v.shape[weight_v.ndim - 1],)
-        return ops.norm(weight_v.view((-1, weight_v.shape[weight_v.ndim - 1])), pows, 0).view(output_size)
-    return _norm_except_dim(weight_v.swapaxes(0, dim), pows, dim).swapaxes(0, dim)
+        return np.linalg.norm(weight_v.reshape((-1, weight_v.shape[weight_v.ndim - 1])), p, 0).reshape(output_size)
+    return _norm_except_dim(weight_v.swapaxes(0, dim), p, dim).swapaxes(0, dim)
 
 
-def _weight_norm(weight_v, weight_g, dim):
-    r"""
-    calculte weight_g/||weight_v|| * weight_v method 
-    """
-    return weight_v * (weight_g / _norm_except_dim(weight_v, 2, dim))
+def _weight_norm(weight_v: ms.Tensor, weight_g: ms.Tensor, dim:int=-1) -> ms.Tensor:
+    ''' weight = weight_g * weight_v / ||weight_v|| '''
+    return weight_g.asnumpy() * weight_v.asnumpy() / _norm_except_dim(weight_v, 2, dim)
 
 
-class WeightNorm:
-    r"""
-    The 'WeightNorm' class implements weight normalization for neural network cells. It provides methods to compute normalized weights, apply weight normalization to a cell, wrap a function, and remove
-    weight bias from a cell. The class also contains an initializer for the name and dimension of the weight parameters, as well as a method to compute the weight using the normalized parameters. Additionally, it
-    includes a method to remove the weight bias and a wrapper function for transposing cell_id to cell. 
-    """
-    name: str
-    dim: int
+def recompute_weight(cell:nn.Cell):
+    name: str = cell.wn_name
+    g = getattr(cell, f'{name}_g')
+    v = getattr(cell, f'{name}_v')
+    new_weight = _weight_norm(v, g, cell.wn_dim)
+    weight: Parameter = getattr(cell, name, None)
+    assert weight is not None, f'property {name!r} not found'
+    weight.set_data(ms.Tensor(new_weight))
 
-    def __init__(self, name: str, dim: int) -> None:
-        if dim is None:
-            dim = -1
-        self.name = name
-        self.dim = dim
 
-    # TODO Make return type more specific
-    def compute_weight(self, cell: Cell) -> Any:
-        g = getattr(cell, self.name + '_g')
-        v = getattr(cell, self.name + '_v')
-        return Parameter(_weight_norm(v, g, self.dim))
+def weight_norm(cell:nn.Cell, name:str='weight', dim:int=-1, axis:int=None) -> nn.Cell:
+    if axis is not None:
+        dim = axis     # compat fix
+    weight: Parameter = getattr(cell, name, None)
+    assert weight is not None, f'property {name!r} not found'
+    dtype = weight.data.dtype
+    setattr(cell, f'{name}_g', Parameter(ms.Tensor(_norm_except_dim(weight.data, 2, dim), dtype)))
+    setattr(cell, f'{name}_v', Parameter(ms.Tensor(weight.data, dtype)))
 
-    @staticmethod
-    def apply(cell: Cell, name: str, dim: int) -> 'WeightNorm':
-        for k, hook in cell._forward_pre_hook.items():
-            if isinstance(hook, WeightNorm) and hook.name == name:
-                raise RuntimeError("Cannot register two weight_norm hooks on "
-                                   "the same parameter {}".format(name))
-
-        if dim is None:
-            dim = -1
-
-        fn = WeightNorm(name, dim)
-
-        weight = getattr(cell, name)
-        # if isinstance(weight, UninitializedParameter):
-        #     raise ValueError(
-        #         'The cell passed to `WeightNorm` can\'t have uninitialized parameters. '
-        #         'Make sure to run the dummy forward before applying weight normalization')
-        # remove w from parameter list
-        del cell._params[name]
-
-        # add g and v as new parameters and express w as g/||v|| * v
-        cell.register_parameter(name + '_g', Parameter(_norm_except_dim(weight, 2, dim)))
-        cell.register_parameter(name + '_v', Parameter(weight))
-        setattr(cell, name, fn.compute_weight(cell))
-
-        # recompute weight before every forward()
-        cell.register_forward_pre_hook(fn)
-
-        return fn
-
-    def wrapper_func(self, cell, func):
-        r"""
-        wrapper_func where used to transpose cell_id to cell
-        """
-
-        def new_func(_, inputs):
-            nonlocal cell
-            return func(cell, inputs)
-
-        return new_func
-
-    def remove(self, cell: Cell) -> None:
-        weight = self.compute_weight(cell)
-        delattr(cell, self.name)
-        del cell._params[self.name + '_g']
-        del cell._params[self.name + '_v']
-        setattr(cell, self.name, weight)
-
-    def __call__(self, cell: Cell, inputs: Any) -> None:
-        setattr(cell, self.name, self.compute_weight(cell))
+    cell.wn_construct = cell.construct
+    def construct_hijack(self:nn.Cell, *args, **kwargs) -> Any:
+        recompute_weight(self)
+        return self.wn_construct(*args, **kwargs)
+    cell.construct = MethodType(construct_hijack, cell)
+    cell.wn_name = name
+    cell.wn_dim = dim
+    return cell
 
 
 def apply_chunking_to_forward(forward_fn, chunk_size, chunk_axis, *input_tensors: ms.Tensor):
@@ -391,3 +283,15 @@ def meshgrid(
     Reference: https://pytorch.org/docs/1.13/generated/torch.meshgrid.html
     """
     return ops.meshgrid(*tensors, indexing=indexing)
+
+
+
+@constexpr
+def finfo(dtype, attr="min"):
+    """finfo api to get dtype attributes."""
+    info = np.finfo(ms.dtype_to_nptype(dtype))
+    if attr == "min":
+        return ms.Tensor(info.min, dtype)
+    if attr == "max":
+        return ms.Tensor(info.max, dtype)
+    return ms.Tensor(0, dtype)

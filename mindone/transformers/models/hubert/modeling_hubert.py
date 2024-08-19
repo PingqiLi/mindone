@@ -23,10 +23,7 @@ import mindspore.nn as nn
 from mindspore import Parameter, Tensor, ops
 from mindspore.common.initializer import initializer, Normal, Uniform, HeNormal
 
-# temporary dependencies from mindnlp v0.3.1
-from mindnlp.modules.functional.weight_norm import weight_norm
-from mindnlp.modules.functional import finfo
-
+from ...mindspore_utils import weight_norm, finfo
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutput, CausalLMOutput, SequenceClassifierOutput
@@ -634,17 +631,18 @@ class HubertEncoder(nn.Cell):
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
+        layer_outputs = ()
 
         if attention_mask is not None:
             # make sure padded tokens output 0
-            expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
+            expand_attention_mask = attention_mask.unsqueeze(-1).tile((1, 1, hidden_states.shape[2]))
             hidden_states[~expand_attention_mask] = 0
 
             # extend attention_mask
             attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
             attention_mask = attention_mask * finfo(hidden_states.dtype, 'min')
-            attention_mask = attention_mask.expand(
-                attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
+            attention_mask = attention_mask.broadcast_to(
+                (attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
             )
 
         position_embeddings = self.pos_conv_embed(hidden_states)
@@ -661,7 +659,7 @@ class HubertEncoder(nn.Cell):
 
             skip_the_layer = self.training and (dropout_probability < self.config.layerdrop)
             if not skip_the_layer:
-                layer_outputs = layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
+                layer_outputs = layer_outputs + (layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions),)
                 hidden_states = layer_outputs[0]
 
             if skip_the_layer:
@@ -703,17 +701,18 @@ class HubertEncoderStableLayerNorm(nn.Cell):
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
+        layer_outputs = ()
 
         if attention_mask is not None:
             # make sure padded tokens are not attended to
-            expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
+            expand_attention_mask = attention_mask.unsqueeze(-1).tile((1, 1, hidden_states.shape[2]))
             hidden_states[~expand_attention_mask] = 0
 
             # extend attention_mask
             attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
             attention_mask = attention_mask * finfo(hidden_states.dtype, 'min')
-            attention_mask = attention_mask.expand(
-                attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
+            attention_mask = attention_mask.broadcast_to(
+                (attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
             )
 
         position_embeddings = self.pos_conv_embed(hidden_states)
@@ -725,11 +724,11 @@ class HubertEncoderStableLayerNorm(nn.Cell):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability =ops.rand([])
+            dropout_probability = ops.rand([])
 
             skip_the_layer = self.training and (dropout_probability < self.config.layerdrop)
             if not skip_the_layer:
-                layer_outputs = layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
+                layer_outputs = layer_outputs + (layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions),)
                 hidden_states = layer_outputs[0]
 
             if skip_the_layer:
@@ -863,7 +862,7 @@ class HubertModel(HubertPreTrainedModel):
                 min_masks=self.config.mask_feature_min_masks,
             )
             mask_feature_indices = Tensor(mask_feature_indices, dtype=mindspore.bool_)
-            mask_feature_indices = mask_feature_indices[:, None].expand(-1, sequence_length, -1)
+            mask_feature_indices = mask_feature_indices[:, None].broadcast_to((-1, sequence_length, -1))
             hidden_states[mask_feature_indices] = 0
 
         return hidden_states

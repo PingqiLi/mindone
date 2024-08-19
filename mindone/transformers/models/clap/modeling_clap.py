@@ -1968,8 +1968,8 @@ class ClapModel(ClapPreTrainedModel):
         text_config = config.text_config
         audio_config = config.audio_config
 
-        self.logit_scale_a = mindspore.Parameter(mindspore.Tensor(math.log(config.logit_scale_init_value)).view(1))
-        self.logit_scale_t = mindspore.Parameter(mindspore.Tensor(math.log(config.logit_scale_init_value)).view(1))
+        self.logit_scale_a = mindspore.Parameter(mindspore.Tensor(math.log(config.logit_scale_init_value)))
+        self.logit_scale_t = mindspore.Parameter(mindspore.Tensor(math.log(config.logit_scale_init_value)))
 
         self.projection_dim = config.projection_dim
 
