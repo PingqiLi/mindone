@@ -69,21 +69,26 @@ _init_weights = True
 def _get_pt2ms_mappings(m):
     mappings = {}  # pt_param_name: (ms_param_name, pt_param_to_ms_param_func)
     for name, cell in m.cells_and_names():
-        if isinstance(cell, nn.Conv1d):
-            mappings[f"{name}.weight"] = f"{name}.weight", lambda x: ms.Parameter(x, name=x.name)
-        if isinstance(cell, nn.Conv1dTranspose):
+        if isinstance(cell, (nn.Conv1d, nn.Conv1dTranspose)):
             mappings[f"{name}.weight"] = f"{name}.weight", lambda x: ms.Parameter(
                 ops.expand_dims(x, axis=-2), name=x.name
             )
         elif isinstance(cell, nn.Embedding):
             mappings[f"{name}.weight"] = f"{name}.embedding_table", lambda x: x
-        elif isinstance(cell, (nn.BatchNorm2d, nn.GroupNorm)):
+        elif isinstance(cell, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
             mappings[f"{name}.weight"] = f"{name}.gamma", lambda x: x
             mappings[f"{name}.bias"] = f"{name}.beta", lambda x: x
             if isinstance(cell, (nn.BatchNorm2d,)):
                 mappings[f"{name}.running_mean"] = f"{name}.moving_mean", lambda x: x
                 mappings[f"{name}.running_var"] = f"{name}.moving_variance", lambda x: x
                 mappings[f"{name}.num_batches_tracked"] = None, lambda x: x
+        if hasattr(cell, "weight_g") and hasattr(cell, "weight_v"):
+            mappings[f"{name}.weight_g"] = f"{name}.weight_g", lambda x: ms.Parameter(
+                ops.expand_dims(x, axis=-2), name=x.name
+            )
+            mappings[f"{name}.weight_v"] = f"{name}.weight_v", lambda x: ms.Parameter(
+                ops.expand_dims(x, axis=-2), name=x.name
+            )
     return mappings
 
 

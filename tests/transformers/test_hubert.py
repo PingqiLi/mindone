@@ -56,7 +56,10 @@ def test_ms_hubert(model_path):
     ],
 )
 def test_hubert(model_name, mode, dtype):
-    ms.set_context(mode=mode, jit_syntax_level=ms.STRICT)
+    if mode == ms.GRAPH_MODE:
+        ms.set_context(mode=mode, jit_syntax_level=ms.STRICT)
+    elif mode == ms.PYNATIVE_MODE:
+        ms.set_context(mode=mode, pynative_synchronize=True)
 
     dataset = load_dataset("hf-internal-testing/librispeech_asr_demo", "clean", split="validation",
                            trust_remote_code=True)
@@ -77,8 +80,16 @@ def test_hubert(model_name, mode, dtype):
         pt_outputs = pt_model(**pt_inputs, output_hidden_states=True)
     ms_outputs = ms_model(**ms_inputs, output_hidden_states=True)
 
-    diffs = _compute_diffs(pt_outputs.hidden_states, ms_outputs.hidden_states)
-    print(f"{np.mean(diffs)}")
+    diffs = _compute_diffs(pt_outputs.hidden_states, ms_outputs[1])
+    pt_outputs = [x for x in pt_outputs.hidden_states]
+    ms_outputs = [x.asnumpy() for x in ms_outputs[1]]
+    pt_mean = np.mean(np.concatenate(pt_outputs))
+    ms_mean = np.mean(np.concatenate(ms_outputs))
+
+    print(f"pt_output_mean: {pt_mean}")
+    print(f"ms_output_mean: {ms_mean}")
+    print(f"relative error with respect to pytorch: {np.abs(pt_mean - ms_mean) / np.abs(pt_mean)}")
+    print(f"diffs mean: {np.mean(diffs)}")
 
 
 def _get_batch_data(dataset, batch_size, processor, sampling_rate):

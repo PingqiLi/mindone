@@ -16,14 +16,18 @@
 
 from typing import Optional, Tuple, Union
 
+import math
 import numpy as np
 
 import mindspore
 import mindspore.nn as nn
 from mindspore import Parameter, Tensor, ops
-from mindspore.common.initializer import initializer, Normal, Uniform, HeNormal
+from mindspore.common.initializer import initializer, Normal, Uniform, HeNormal, HeUniform, \
+    _calculate_fan_in_and_fan_out
+import mindspore.common.dtype as mstype
 
-from ...mindspore_utils import weight_norm, finfo
+from ...mindspore_utils import finfo
+from ...weight_norm import weight_norm
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutput, CausalLMOutput, SequenceClassifierOutput
@@ -208,7 +212,7 @@ class HubertLayerNormConvLayer(nn.Cell):
             has_bias=config.conv_bias,
             pad_mode="valid",
         )
-        self.layer_norm = nn.LayerNorm(self.out_conv_dim)
+        self.layer_norm = nn.LayerNorm([self.out_conv_dim])
         self.activation = ACT2FN[config.feat_extract_activation]
 
     def construct(self, hidden_states):
@@ -246,20 +250,121 @@ class HubertGroupNormConvLayer(nn.Cell):
         return hidden_states
 
 
+from mindspore.ops import operations as P
+
+
+def _norm_except_dim(weight_v, pows, dim):
+    if dim == -1:
+        return ops.norm(weight_v, pows)
+    if dim == 0:
+        w_shape_v = weight_v.shape[0]  # avoid macOS error
+        output_size = (w_shape_v,) + (1,) * (weight_v.ndim - 1)
+        return ops.norm(weight_v.view((w_shape_v, -1)), pows, 1).view(output_size)
+    if dim == (weight_v.ndim - 1):
+        output_size = (1,) * (weight_v.ndim - 1) + (weight_v.shape[weight_v.ndim - 1],)
+        return ops.norm(weight_v.view((-1, weight_v.shape[weight_v.ndim - 1])), pows, 0).view(output_size)
+    return _norm_except_dim(weight_v.swapaxes(0, dim), pows, dim).swapaxes(0, dim)
+
+
+def _weight_norm(weight_v, weight_g, dim):
+    return weight_v * (weight_g / _norm_except_dim(weight_v, 2, dim))
+
+
+class _Conv1dWeightNorm(nn.Cell):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 pad_mode='same',
+                 padding=0,
+                 dilation=1,
+                 group=1,
+                 has_bias=False,
+                 weight_init=None,
+                 bias_init=None,
+                 dtype=mstype.float32,
+                 dim=0):
+        super(_Conv1dWeightNorm, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (1, kernel_size)
+        self.pad_mode = pad_mode
+        self.stride = (1, stride)
+        self.padding = (0, 0, padding, padding)
+        self.dilation = (1, dilation)
+        self.group = group
+        self.has_bias = has_bias
+        self.bias_init = bias_init
+        self.dim = dim
+
+        self.conv2d = P.Conv2D(out_channel=self.out_channels,
+                               kernel_size=self.kernel_size,
+                               mode=1,
+                               pad_mode=self.pad_mode,
+                               pad=self.padding,
+                               stride=self.stride,
+                               dilation=self.dilation,
+                               group=self.group)
+
+        weight_shape = (out_channels, in_channels // group, *self.kernel_size)
+        if weight_init is None:
+            weight_init = HeUniform(math.sqrt(5))
+        self.weight_init = weight_init
+
+        weight_g_shape = [1] * len(weight_shape)
+        weight_g_shape[dim] = weight_shape[dim]
+        self.weight_g = Parameter(Tensor(np.ones(weight_shape), dtype=dtype), name='weight_g')
+        # [out_channels, in_channels/groups, 1, kernel_size]
+        self.weight_v = Parameter(initializer(weight_init, weight_shape, dtype=dtype), name='weight_v')
+
+        if has_bias:
+            if bias_init is None:
+                fan_in, _ = _calculate_fan_in_and_fan_out(weight_shape)
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    bias_init = Uniform(bound)
+                else:
+                    bias_init = 'zeros'
+                self.bias_init = bias_init
+            self.bias = Parameter(initializer(self.bias_init, [out_channels], dtype=dtype), name='bias')
+        else:
+            self.bias = None
+
+        self.bias_add = P.BiasAdd()
+        self.expand_dims = P.ExpandDims()
+        self.squeeze = P.Squeeze(2)
+
+    def construct(self, x):
+        x = self.expand_dims(x, 2)
+
+        # 计算归一化后的权重
+        weight = _weight_norm(self.weight_v, self.weight_g, self.dim)
+
+        output = self.conv2d(x, weight)
+
+        if self.has_bias:
+            output = self.bias_add(output, self.bias)
+
+        output = self.squeeze(output)
+
+        return output
+
+
 # Copied from transformers.models.wav2vec2.modeling_wav2vec2.Wav2Vec2PositionalConvEmbedding with Wav2Vec2->Hubert
 class HubertPositionalConvEmbedding(nn.Cell):
     def __init__(self, config: HubertConfig):
         super().__init__()
-        self.conv = nn.Conv1d(
+        self.conv = _Conv1dWeightNorm(
             config.hidden_size,
             config.hidden_size,
             kernel_size=config.num_conv_pos_embeddings,
             pad_mode='pad',
             padding=config.num_conv_pos_embeddings // 2,
             group=config.num_conv_pos_embedding_groups,
-            has_bias=True,      # TODO: confirm this
+            has_bias=True,
+            dim=3
         )
-        self.conv = weight_norm(self.conv, name='weight', dim=2)
         self.padding = HubertSamePadLayer(config.num_conv_pos_embeddings)
         self.activation = ACT2FN[config.feat_extract_activation]
 
@@ -320,7 +425,7 @@ class HubertFeatureProjection(nn.Cell):
         super().__init__()
         self.feat_proj_layer_norm = config.feat_proj_layer_norm
         if self.feat_proj_layer_norm:
-            self.layer_norm = nn.LayerNorm(config.conv_dim[-1], epsilon=config.layer_norm_eps)
+            self.layer_norm = nn.LayerNorm([config.conv_dim[-1]], epsilon=config.layer_norm_eps)
         self.projection = nn.Dense(config.conv_dim[-1], config.hidden_size)
         self.dropout = nn.Dropout(p=config.feat_proj_dropout)
 
@@ -521,9 +626,9 @@ class HubertEncoderLayer(nn.Cell):
             is_decoder=False,
         )
         self.dropout = nn.Dropout(p=config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
 
     def construct(self, hidden_states, attention_mask=None, output_attentions=False):
         attn_residual = hidden_states
@@ -554,7 +659,7 @@ class HubertAttnAdapterLayer(nn.Cell):
         self.input_dim = config.adapter_attn_dim
         self.hidden_dim = config.hidden_size
 
-        self.norm = nn.LayerNorm(self.hidden_dim)
+        self.norm = nn.LayerNorm([self.hidden_dim])
         self.linear_1 = nn.Dense(self.hidden_dim, self.input_dim)
         self.act_fn = nn.ReLU()
         self.linear_2 = nn.Dense(self.input_dim, self.hidden_dim)
@@ -578,9 +683,9 @@ class HubertEncoderLayerStableLayerNorm(nn.Cell):
             is_decoder=False,
         )
         self.dropout = nn.Dropout(p=config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
 
         if getattr(config, "adapter_attn_dim", None) is not None:
             self.adapter_layer = HubertAttnAdapterLayer(config)
@@ -617,7 +722,7 @@ class HubertEncoder(nn.Cell):
         super().__init__()
         self.config = config
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
         self.dropout = nn.Dropout(p=config.hidden_dropout)
         self.layers = nn.CellList([HubertEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
@@ -627,7 +732,7 @@ class HubertEncoder(nn.Cell):
         attention_mask: Optional[Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        return_dict: bool = True,
+        return_dict: bool = False,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -659,7 +764,7 @@ class HubertEncoder(nn.Cell):
 
             skip_the_layer = self.training and (dropout_probability < self.config.layerdrop)
             if not skip_the_layer:
-                layer_outputs = layer_outputs + (layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions),)
+                layer_outputs = layer_outputs + layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
                 hidden_states = layer_outputs[0]
 
             if skip_the_layer:
@@ -687,7 +792,7 @@ class HubertEncoderStableLayerNorm(nn.Cell):
         super().__init__()
         self.config = config
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm([config.hidden_size], epsilon=config.layer_norm_eps)
         self.dropout = nn.Dropout(p=config.hidden_dropout)
         self.layers = nn.CellList([HubertEncoderLayerStableLayerNorm(config) for _ in range(config.num_hidden_layers)])
 
@@ -697,7 +802,7 @@ class HubertEncoderStableLayerNorm(nn.Cell):
         attention_mask=None,
         output_attentions=False,
         output_hidden_states=False,
-        return_dict=True,
+        return_dict=False,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -728,7 +833,7 @@ class HubertEncoderStableLayerNorm(nn.Cell):
 
             skip_the_layer = self.training and (dropout_probability < self.config.layerdrop)
             if not skip_the_layer:
-                layer_outputs = layer_outputs + (layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions),)
+                layer_outputs = layer_outputs + layer(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
                 hidden_states = layer_outputs[0]
 
             if skip_the_layer:
@@ -769,8 +874,8 @@ class HubertPreTrainedModel(MSPreTrainedModel):
             # cf https://github.com/pytorch/pytorch/pull/5617
             cell.weight.set_data(initializer(Normal(self.config.initializer_range), cell.weight.shape, cell.weight.dtype))
         elif isinstance(cell, (nn.LayerNorm, nn.GroupNorm)):
-            cell.weight.set_data(initializer('ones', cell.weight.shape, cell.weight.dtype))
-            cell.bias.set_data(initializer('zeros', cell.bias.shape, cell.bias.dtype))
+            cell.gamma.set_data(initializer('ones', cell.gamma.shape, cell.gamma.dtype))
+            cell.beta.set_data(initializer('zeros', cell.beta.shape, cell.beta.dtype))
         elif isinstance(cell, nn.Conv1d):
             cell.weight.set_data(initializer(HeNormal(), cell.weight.shape, cell.weight.dtype))
         if isinstance(cell, (nn.Dense, nn.Conv1d)) and cell.bias is not None:
@@ -874,7 +979,7 @@ class HubertModel(HubertPreTrainedModel):
         mask_time_indices: Optional[Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutput]:
         """
 
@@ -1006,7 +1111,7 @@ class HubertForCTC(HubertPreTrainedModel):
         attention_mask: Optional[Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
         labels: Optional[Tensor] = None,
     ) -> Union[Tuple, CausalLMOutput]:
         r"""
@@ -1109,7 +1214,7 @@ class HubertForSequenceClassification(HubertPreTrainedModel):
         attention_mask: Optional[Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
         labels: Optional[Tensor] = None,
     ) -> Union[Tuple, SequenceClassifierOutput]:
         r"""
