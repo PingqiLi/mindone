@@ -25,9 +25,9 @@ from mindspore import nn, ops
 from mindspore.common.initializer import initializer, Normal
 
 # temporary dependencies from mindnlp
-from mindnlp.transformers.ms_utils import (
-    apply_chunking_to_forward, find_pruneable_heads_and_indices, meshgrid, prune_linear_layer
-)
+# from mindnlp.transformers.ms_utils import (
+#     apply_chunking_to_forward, find_pruneable_heads_and_indices, meshgrid, prune_linear_layer
+# )
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (

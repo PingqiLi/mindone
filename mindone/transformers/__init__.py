@@ -16,15 +16,6 @@ from .models.clap import (
     ClapAudioModel,
     ClapAudioModelWithProjection,
 )
-from .models.clip import (
-    CLIP_PRETRAINED_MODEL_ARCHIVE_LIST,
-    CLIPModel,
-    CLIPPreTrainedModel,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-    CLIPVisionModel,
-    CLIPVisionModelWithProjection,
-)
 from .models.dpt import DPTForDepthEstimation
 from .models.hubert import (
     HUBERT_PRETRAINED_MODEL_ARCHIVE_LIST,
